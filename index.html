@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Urban Transit Sim</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        /* Custom Keyframes from original tailwind config */
+        @keyframes dash {
+            to { stroke-dashoffset: -24; }
+        }
+        
+        /* Polyfills for animate-in tailwindcss-animate plugin equivalents */
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes zoomIn { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+        @keyframes slideInFromBottom { from { transform: translateY(1.25rem); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        @keyframes slideInFromLeft { from { transform: translateX(-1.25rem); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        
+        .animate-in {
+            animation-duration: 300ms;
+            animation-fill-mode: both;
+        }
+        .fade-in { animation-name: fadeIn; }
+        .zoom-in { animation-name: zoomIn; }
+        .slide-in-from-bottom-4, .slide-in-from-bottom-5 { animation-name: slideInFromBottom; }
+        .slide-in-from-left-4 { animation-name: slideInFromLeft; }
+    </style>
+</head>
+<body id="body" class="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans transition-all duration-700">
+    
+    <div id="app" class="flex flex-col flex-1 h-full w-full"></div>
+    <div id="toast-container" class="fixed bottom-4 right-4 flex flex-col gap-2 z-50"></div>
+
+    <script>
+        // --- CONSTANTS & CONFIGURATION ---
+
+        const DIFFICULTY_CONFIG = {
+            easy:   { startBudget: 80000, budgetPerTurn: 15000, maxTurns: 5, targetCarbon: 50, targetSatisfaction: 60 },
+            medium: { startBudget: 50000, budgetPerTurn: 10000, maxTurns: 5, targetCarbon: 40, targetSatisfaction: 70 },
+            hard:   { startBudget: 30000, budgetPerTurn: 7000,  maxTurns: 5, targetCarbon: 30, targetSatisfaction: 80 },
+        };
+
+        const ROUTE_CONFIGS = {
+            bus:   { type: "bus",   name: "Bus Line",   carbonPerKm: 8.5,  capacityPerHour: 80,  costPerKm: 500,  isElectric: false },
+            tram:  { type: "tram",  name: "Tram Line",  carbonPerKm: 2.1,  capacityPerHour: 200, costPerKm: 2000, isElectric: true  },
+            metro: { type: "metro", name: "Metro Line", carbonPerKm: 1.2,  capacityPerHour: 800, costPerKm: 8000, isElectric: true  },
+            ferry: { type: "ferry", name: "Ferry Line", carbonPerKm: 12.0, capacityPerHour: 150, costPerKm: 1500, isElectric: false },
+        };
+
+        const ROUTE_COLORS = {
+            bus: "#22c55e", tram: "#3b82f6", metro: "#a855f7", ferry: "#06b6d4",
+        };
+
+        const CELL_COLORS = {
+            residential: "#86efac", commercial: "#93c5fd", industrial: "#fca5a5",
+            park: "#bbf7d0", water: "#a5f3fc"
+        };
+
+        const EVENTS = [
+            { title: "Climate Rally",        description: "Citizens demand greener transit.", impact: { publicSupport: 10 } },
+            { title: "Fuel Price Spike",     description: "Operating costs soar for fossil fuels.", impact: { budget: -3000 } },
+            { title: "Tech Grant",           description: "Government funding for infrastructure.", impact: { budget: 10000 } },
+            { title: "Traffic Gridlock",     description: "Major roads are jammed.", impact: { satisfaction: -10, publicSupport: -5 } },
+            { title: "Electric Bus Subsidy", description: "Rebates received for electric fleets.", impact: { budget: 5000 } },
+            { title: "Station Vandalism",    description: "Cleanup required at major hubs.", impact: { satisfaction: -8, budget: -1000 } },
+            { title: "Tourism Boost",        description: "Visitors flock to your city.", impact: { budget: 8000, satisfaction: 8 } },
+        ];
+
+        // --- GLOBAL STATE ---
+        let gameState = null;
+        let placement = { active: false, type: null, stops: [] };
+        let selectedRouteId = null;
+        let showTutorialModal = false;
+        let confirmRestartModal = false;
+        
+        let isInvertedMode = false;
+        let currentCityName = 'Metropolis';
+        let currentDifficulty = 'medium';
+        let sidebarScroll = 0; // maintain scroll state
+
+        // --- GAME ENGINE ---
+        const generateGrid = (width, height) => {
+            const grid = [];
+            const types = ["residential", "residential", "residential", "commercial", "commercial", "industrial", "park", "water"];
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    grid.push({
+                        id: `${x}-${y}`, x, y,
+                        type: types[Math.floor(Math.random() * types.length)],
+                        population: Math.floor(Math.random() * 100) + 10,
+                        hasStation: false, stationLevel: 0, routes: []
+                    });
+                }
+            }
+            return grid;
+        };
+
+        const calculateDistance = (cellA, cellB) => {
+            return Math.abs(cellA.x - cellB.x) + Math.abs(cellA.y - cellB.y);
+        };
+
+        const calculateMetrics = (state) => {
+            let newCarbon = 100; // Baseline
+            let newSatisfaction = 50; // Baseline
+            let totalCoverage = 0;
+
+            state.grid.forEach(cell => {
+                if (cell.hasStation) totalCoverage += cell.population;
+            });
+            
+            const coverageRatio = totalCoverage / Math.max(1, state.grid.reduce((sum, c) => sum + c.population, 0));
+            newSatisfaction += (coverageRatio * 50);
+
+            state.routes.forEach(route => {
+                let distance = 0;
+                for(let i=0; i<route.stops.length-1; i++) {
+                    const c1 = state.grid.find(c => c.id === route.stops[i]);
+                    const c2 = state.grid.find(c => c.id === route.stops[i+1]);
+                    if(c1 && c2) distance += calculateDistance(c1, c2);
+                }
+                const config = ROUTE_CONFIGS[route.type];
+                newCarbon += (distance * config.carbonPerKm) / 10;
+                if(config.isElectric) newCarbon -= 5;
+            });
+
+            newCarbon = Math.max(0, Math.min(200, newCarbon));
+            newSatisfaction = Math.max(0, Math.min(100, newSatisfaction));
+
+            return { carbonFootprint: Math.floor(newCarbon), satisfaction: Math.floor(newSatisfaction) };
+        };
+
+        // --- ACTIONS ---
+
+        window.showNotification = (msg, type = 'info') => {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            const icon = type === 'error' ? 'alert-triangle' : 'activity';
+            const bg = type === 'error' ? 'bg-red-500' : 'bg-blue-600';
+            
+            toast.className = `p-4 rounded-lg shadow-xl flex items-center gap-3 text-white transition-all z-50 animate-in slide-in-from-bottom-5 fade-in ${bg}`;
+            toast.innerHTML = `
+                <i data-lucide="${icon}" class="w-5 h-5"></i>
+                <p class="font-medium">${msg}</p>
+                <button onclick="this.parentElement.remove()" class="p-1 hover:bg-white/20 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
+            `;
+            container.appendChild(toast);
+            lucide.createIcons({ root: toast });
+            setTimeout(() => { if(toast.parentElement) toast.remove(); }, 4000);
+        };
+
+        window.startGame = (cityName, difficulty) => {
+            const config = DIFFICULTY_CONFIG[difficulty];
+            selectedRouteId = null;
+            showTutorialModal = true;
+            gameState = {
+                id: Math.random().toString(36).substr(2, 9),
+                cityName: cityName || "Metropolis",
+                difficulty,
+                turn: 1,
+                budget: config.startBudget,
+                carbonFootprint: 100,
+                satisfaction: 40,
+                publicSupport: 50,
+                gridWidth: 10,
+                gridHeight: 10,
+                grid: generateGrid(10, 10),
+                routes: [],
+                events: [],
+                activeEvent: null,
+                gameOver: false,
+                gameWon: false,
+                score: 0,
+                ...config
+            };
+            render();
+        };
+
+        window.endTurn = () => {
+            if (!gameState || gameState.gameOver) return;
+
+            let budgetChange = gameState.budgetPerTurn;
+            
+            // Maintenance Costs
+            gameState.routes.forEach(route => {
+                let distance = route.stops.length > 1 ? route.stops.length * 2 : 0;
+                budgetChange -= (distance * (ROUTE_CONFIGS[route.type].costPerKm * 0.1));
+            });
+
+            // Events
+            if (Math.random() < 0.3) {
+                const eventDef = EVENTS[Math.floor(Math.random() * EVENTS.length)];
+                gameState.activeEvent = { ...eventDef, id: Math.random().toString() };
+                if (eventDef.impact.budget) budgetChange += eventDef.impact.budget;
+                if (eventDef.impact.satisfaction) gameState.satisfaction += eventDef.impact.satisfaction;
+                if (eventDef.impact.publicSupport) gameState.publicSupport += eventDef.impact.publicSupport;
+            } else {
+                gameState.activeEvent = null;
+            }
+
+            gameState.budget += budgetChange;
+            gameState.turn += 1;
+
+            // Recalculate metrics
+            const metrics = calculateMetrics(gameState);
+            gameState.carbonFootprint = metrics.carbonFootprint;
+            gameState.satisfaction = metrics.satisfaction;
+
+            // Win/Loss Condition Check
+            if (gameState.turn >= gameState.maxTurns) {
+                gameState.gameOver = true;
+                gameState.gameWon = (gameState.carbonFootprint <= gameState.targetCarbon && gameState.satisfaction >= gameState.targetSatisfaction);
+                gameState.score = Math.floor(gameState.budget / 1000) + (gameState.satisfaction * 10) - gameState.carbonFootprint;
+            }
+
+            placement = { active: false, type: null, stops: [] };
+
+            const formattedChange = budgetChange >= 0 ? `+$${budgetChange.toLocaleString()}` : `-$${Math.abs(budgetChange).toLocaleString()}`;
+            showNotification(`Turn ${gameState.turn} started! Budget changed by ${formattedChange}`);
+
+            render();
+        };
+
+        window.toggleStop = (cellId) => {
+            if (!placement.active) return;
+            
+            const cell = gameState.grid.find(c => c.id === cellId);
+            if (placement.type === 'ferry' && cell.type !== 'water') {
+                showNotification("Ferries can only stop on water tiles!", "error");
+                return;
+            }
+            
+            const isSelected = placement.stops.includes(cellId);
+            if (isSelected) {
+                placement.stops = placement.stops.filter(id => id !== cellId);
+            } else {
+                placement.stops.push(cellId);
+            }
+            render();
+        };
+
+        window.confirmRoute = () => {
+            if (placement.stops.length < 2) {
+                showNotification("A route needs at least 2 stops!", "error");
+                return;
+            }
+
+            const config = ROUTE_CONFIGS[placement.type];
+            
+            let distance = 0;
+            for(let i=0; i<placement.stops.length-1; i++) {
+                const c1 = gameState.grid.find(c => c.id === placement.stops[i]);
+                const c2 = gameState.grid.find(c => c.id === placement.stops[i+1]);
+                distance += calculateDistance(c1, c2);
+            }
+            const cost = distance * config.costPerKm;
+
+            if (gameState.budget < cost) {
+                showNotification(`Insufficient funds! Need $${cost.toLocaleString()}`, "error");
+                return;
+            }
+
+            gameState.budget -= cost;
+            
+            const newRoute = {
+                id: Math.random().toString(36).substr(2, 9),
+                type: placement.type,
+                stops: placement.stops,
+                color: ROUTE_COLORS[placement.type]
+            };
+            gameState.routes.push(newRoute);
+
+            // Upgrade cells
+            placement.stops.forEach(stopId => {
+                const cell = gameState.grid.find(c => c.id === stopId);
+                if (cell) {
+                    cell.hasStation = true;
+                    if (!cell.routes.includes(newRoute.id)) cell.routes.push(newRoute.id);
+                }
+            });
+
+            const metrics = calculateMetrics(gameState);
+            gameState.carbonFootprint = metrics.carbonFootprint;
+            gameState.satisfaction = metrics.satisfaction;
+
+            showNotification(`Successfully built ${config.name}!`);
+            placement = { active: false, type: null, stops: [] };
+            render();
+        };
+
+        window.deleteRoute = (event) => {
+            if(event) event.stopPropagation();
+            if (!selectedRouteId) return;
+
+            gameState.routes = gameState.routes.filter(r => r.id !== selectedRouteId);
+            
+            gameState.grid = gameState.grid.map(cell => {
+                const newRoutes = cell.routes.filter(rid => rid !== selectedRouteId);
+                return {
+                    ...cell,
+                    routes: newRoutes,
+                    hasStation: newRoutes.length > 0
+                };
+            });
+
+            const metrics = calculateMetrics(gameState);
+            gameState.carbonFootprint = metrics.carbonFootprint;
+            gameState.satisfaction = metrics.satisfaction;
+
+            showNotification("Route deleted. No refund issued.", "info");
+            selectedRouteId = null;
+            render();
+        };
+
+        // --- UI HELPERS ---
+
+        const getCellIconHTML = (type) => {
+            switch(type) {
+                case 'residential': return '<i data-lucide="home" class="text-emerald-700/30 w-6 h-6"></i>';
+                case 'commercial': return '<i data-lucide="building-2" class="text-blue-700/30 w-6 h-6"></i>';
+                case 'industrial': return '<i data-lucide="factory" class="text-red-700/30 w-6 h-6"></i>';
+                case 'park': return '<i data-lucide="tree-pine" class="text-green-800/40 w-6 h-6"></i>';
+                case 'water': return '<i data-lucide="waves" class="text-cyan-800/40 w-6 h-6"></i>';
+                default: return '';
+            }
+        };
+
+        const getRouteIconName = (type) => {
+            switch(type) {
+                case 'bus': return 'bus';
+                case 'tram': return 'tram-front';
+                case 'metro': return 'train';
+                case 'ferry': return 'ship';
+                default: return 'map';
+            }
+        };
+
+        const renderStatBadge = (icon, label, value, target, colorClass, inverse = false) => {
+            const valNum = parseFloat(value.toString().replace(/[^0-9.-]+/g,""));
+            const isFailing = target !== undefined && (inverse ? valNum > target : valNum < target);
+            return `
+                <div class="flex flex-col items-center">
+                    <div class="flex items-center gap-1">
+                        <i data-lucide="${icon}" class="${colorClass} w-4 h-4"></i>
+                        <span class="text-xs text-slate-400 font-bold uppercase tracking-wider">${label}</span>
+                    </div>
+                    <div class="flex items-baseline gap-1">
+                        <span class="text-xl font-black ${isFailing ? 'text-red-400' : 'text-white'}">${value}</span>
+                        ${target !== undefined ? `<span class="text-xs text-slate-500 font-medium">/ ${target}</span>` : ''}
+                    </div>
+                </div>
+            `;
+        };
+
+        // --- RENDERERS ---
+
+        const getStartScreenHTML = () => `
+            <div class="min-h-screen flex items-center justify-center p-4">
+                <div class="bg-slate-800 p-8 rounded-2xl shadow-2xl max-w-md w-full border border-slate-700">
+                    <h1 class="text-4xl font-black text-white mb-2 flex items-center gap-3 drop-shadow-[0_0_8px_rgba(255,255,255,0.2)]">
+                        <i data-lucide="map" class="text-cyan-400 drop-shadow-[0_0_12px_rgba(34,211,238,0.9)] w-10 h-10"></i> Transit Sim
+                    </h1>
+                    <p class="text-slate-400 mb-8 text-sm">Build the sustainable transit network of the future.</p>
+                    
+                    <div class="space-y-4 mb-8">
+                        <div>
+                            <label class="block text-xs font-bold text-slate-400 uppercase mb-2">City Name</label>
+                            <input id="city-name-input" oninput="currentCityName = this.value" value="${currentCityName}" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white focus:border-cyan-400 focus:shadow-[0_0_10px_rgba(34,211,238,0.4)] focus:outline-none transition-all" />
+                        </div>
+                        <div>
+                            <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Difficulty</label>
+                            <div class="grid grid-cols-3 gap-2">
+                                ${['easy', 'medium', 'hard'].map(d => `
+                                    <button onclick="currentDifficulty='${d}'; render();" class="p-2 rounded-lg text-sm font-bold capitalize border transition-all ${currentDifficulty === d ? 'bg-blue-600 border-blue-400 text-white shadow-[0_0_15px_rgba(96,165,250,0.6)]' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-500'}">
+                                        ${d}
+                                    </button>
+                                `).join('')}
+                            </div>
+                        </div>
+                    </div>
+                    <button onclick="startGame(document.getElementById('city-name-input').value, currentDifficulty)" class="w-full bg-green-500 hover:bg-green-400 text-slate-900 font-black text-lg py-3 rounded-xl shadow-[0_0_20px_rgba(34,197,94,0.6)] hover:shadow-[0_0_30px_rgba(74,222,128,0.8)] transition-all">
+                        START PLANNING
+                    </button>
+                </div>
+            </div>
+        `;
+
+        const getGameOverScreenHTML = () => {
+            const won = gameState.gameWon;
+            
+            // Neon Class Logic
+            const titleCls = won ? 'text-green-400 drop-shadow-[0_0_15px_rgba(74,222,128,0.8)]' : 'text-red-500 drop-shadow-[0_0_15px_rgba(239,68,68,0.9)]';
+            const budgetCls = 'text-yellow-300 drop-shadow-[0_0_10px_rgba(253,224,71,0.8)]';
+            const carbonCls = gameState.carbonFootprint <= gameState.targetCarbon ? 'text-green-400 drop-shadow-[0_0_10px_rgba(74,222,128,0.8)]' : 'text-red-500 drop-shadow-[0_0_10px_rgba(239,68,68,0.8)]';
+            const satCls = gameState.satisfaction >= gameState.targetSatisfaction ? 'text-cyan-400 drop-shadow-[0_0_10px_rgba(34,211,238,0.8)]' : 'text-red-500 drop-shadow-[0_0_10px_rgba(239,68,68,0.8)]';
+
+            return `
+            <div class="min-h-screen flex items-center justify-center p-4">
+                <div class="bg-slate-800 p-8 rounded-2xl shadow-2xl max-w-md w-full border border-slate-700 text-center animate-in zoom-in duration-300">
+                    <h1 class="text-5xl font-black mb-2 ${titleCls} tracking-tight">
+                        ${won ? 'CITY SAVED!' : 'GRIDLOCK!'}
+                    </h1>
+                    <p class="text-slate-400 mb-6">Your tenure as Transit Director has ended.</p>
+                    
+                    <div class="grid grid-cols-2 gap-4 mb-8">
+                        <div class="bg-slate-900 p-4 rounded-xl border border-slate-700">
+                            <div class="text-slate-400 text-xs font-bold uppercase mb-1">Final Score</div>
+                            <div class="text-3xl font-black text-white drop-shadow-[0_0_8px_rgba(255,255,255,0.6)]">${gameState.score}</div>
+                        </div>
+                        <div class="bg-slate-900 p-4 rounded-xl border border-slate-700 flex flex-col justify-center">
+                            <div class="text-slate-400 text-xs font-bold uppercase mb-1">Budget Left</div>
+                            <div class="text-xl font-black ${budgetCls}">$${gameState.budget.toLocaleString()}</div>
+                        </div>
+                        <div class="bg-slate-900 p-4 rounded-xl border border-slate-700">
+                            <div class="text-slate-400 text-xs font-bold uppercase mb-1">Carbon</div>
+                            <div class="text-3xl font-black ${carbonCls}">
+                                ${gameState.carbonFootprint} <span class="text-sm text-slate-500 drop-shadow-none">/ ${gameState.targetCarbon}</span>
+                            </div>
+                        </div>
+                        <div class="bg-slate-900 p-4 rounded-xl border border-slate-700">
+                            <div class="text-slate-400 text-xs font-bold uppercase mb-1">Satisfaction</div>
+                            <div class="text-3xl font-black ${satCls}">
+                                ${gameState.satisfaction}% <span class="text-sm text-slate-500 drop-shadow-none">/ ${gameState.targetSatisfaction}%</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <button onclick="gameState=null; render();" class="w-full bg-blue-500 hover:bg-blue-400 text-white font-black py-4 rounded-xl shadow-[0_0_20px_rgba(59,130,246,0.6)] hover:shadow-[0_0_30px_rgba(96,165,250,0.8)] transition-all flex items-center justify-center gap-2">
+                        <i data-lucide="rotate-ccw" class="w-6 h-6"></i> PLAY AGAIN
+                    </button>
+                </div>
+            </div>
+            `;
+        };
+
+        const getGameScreenHTML = () => {
+            let html = '';
+
+            // Modals
+            if (showTutorialModal) {
+                html += `
+                <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-sm">
+                    <div class="bg-slate-800 border border-slate-700 p-6 rounded-2xl max-w-lg w-full shadow-2xl animate-in fade-in zoom-in duration-200">
+                        <h2 class="text-2xl font-black text-white mb-4 flex items-center gap-2">
+                            <i data-lucide="info" class="text-blue-400 w-6 h-6"></i> How to Play
+                        </h2>
+                        <div class="space-y-4 text-slate-300 text-sm leading-relaxed">
+                            <p>Welcome to Urban Transit Sim! Your goal is to build a sustainable and popular public transport network.</p>
+                            <ul class="space-y-3 list-disc pl-5 marker:text-blue-500">
+                                <li><strong>The Goal:</strong> Keep your Carbon footprint below the target and Satisfaction above the target by the end of your turns.</li>
+                                <li><strong>Building Routes:</strong> Select a vehicle type from the left menu. Click cells on the grid to create stops. Click 'Confirm' to build.</li>
+                                <li><strong>Management:</strong> Watch your budget! Each route costs money to build and maintain. Note that Ferries can only stop on water tiles.</li>
+                                <li><strong>Events:</strong> Each turn might bring random events that help or hinder your progress. Adapt your strategy!</li>
+                            </ul>
+                        </div>
+                        <button onclick="showTutorialModal=false; render();" class="mt-8 w-full bg-blue-600 hover:bg-blue-500 text-white py-3 rounded-xl font-bold transition-all">Got it, let's build!</button>
+                    </div>
+                </div>`;
+            }
+
+            if (confirmRestartModal) {
+                html += `
+                <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-sm animate-in fade-in duration-200">
+                    <div class="bg-slate-800 border border-slate-700 p-6 rounded-2xl max-w-sm w-full shadow-2xl">
+                        <h3 class="text-xl font-bold text-white mb-2">Restart Game?</h3>
+                        <p class="text-slate-300 text-sm mb-6">Are you sure you want to restart? All your progress for ${gameState.cityName} will be lost.</p>
+                        <div class="flex gap-3">
+                            <button onclick="confirmRestartModal=false; render();" class="flex-1 bg-slate-700 hover:bg-slate-600 text-white py-2 rounded-lg font-medium transition-colors">Cancel</button>
+                            <button onclick="confirmRestartModal=false; gameState=null; render();" class="flex-1 bg-red-600 hover:bg-red-500 text-white py-2 rounded-lg font-medium transition-colors">Restart</button>
+                        </div>
+                    </div>
+                </div>`;
+            }
+
+            // Header
+            html += `
+            <header class="bg-slate-800 border-b border-slate-700 p-4 flex flex-wrap gap-4 items-center justify-between shadow-md z-10 relative">
+                <div class="flex items-center gap-3">
+                    <i data-lucide="map" class="text-blue-400 w-7 h-7"></i>
+                    <div>
+                        <h1 class="text-xl font-bold leading-tight">${gameState.cityName} Transit</h1>
+                        <p class="text-xs text-slate-400 uppercase tracking-wider">
+                            Turn ${gameState.turn} / ${gameState.maxTurns} • ${gameState.difficulty} Mode
+                        </p>
+                    </div>
+                    <button onclick="confirmRestartModal=true; render();" class="ml-2 p-2 bg-slate-700/50 hover:bg-slate-700 rounded-full text-slate-400 hover:text-white transition-colors" title="Restart Game">
+                        <i data-lucide="rotate-ccw" class="w-4 h-4"></i>
+                    </button>
+                    <button onclick="isInvertedMode=!isInvertedMode; document.getElementById('body').classList.toggle('invert', isInvertedMode); render();" class="p-2 rounded-full transition-colors ${isInvertedMode ? 'bg-slate-600 text-white shadow-inner' : 'bg-slate-700/50 hover:bg-slate-700 text-slate-400 hover:text-white'}" title="Toggle Color Inversion">
+                        <i data-lucide="contrast" class="w-4 h-4"></i>
+                    </button>
+                    <button onclick="showTutorialModal=true; render();" class="p-2 bg-slate-700/50 hover:bg-slate-700 rounded-full text-slate-400 hover:text-blue-400 transition-colors" title="Show Tutorial">
+                        <i data-lucide="info" class="w-4 h-4"></i>
+                    </button>
+                </div>
+
+                <div class="flex flex-wrap gap-6 items-center flex-1 justify-center max-w-4xl">
+                    ${renderStatBadge('coins', 'Budget', `$${gameState.budget.toLocaleString()}`, undefined, 'text-yellow-400')}
+                    ${renderStatBadge('leaf', 'Carbon', gameState.carbonFootprint, gameState.targetCarbon, 'text-green-400', true)}
+                    ${renderStatBadge('smile', 'Satisfaction', `${gameState.satisfaction}%`, gameState.targetSatisfaction, 'text-blue-400')}
+                    ${renderStatBadge('users', 'Support', `${gameState.publicSupport}%`, undefined, 'text-purple-400')}
+                </div>
+
+                <button onclick="endTurn()" class="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2 rounded-full font-bold shadow-lg shadow-blue-500/20 transition-all active:scale-95 flex items-center gap-2 group">
+                    End Turn <i data-lucide="chevron-right" class="w-4 h-4 group-hover:translate-x-1 transition-transform"></i>
+                </button>
+            </header>
+            `;
+
+            // Main Content
+            html += `<main class="flex-1 flex overflow-hidden">`;
+
+            // Sidebar
+            html += `<aside id="sidebar-scroll" class="w-80 bg-slate-800 border-r border-slate-700 p-5 flex flex-col gap-6 overflow-y-auto z-10 relative shadow-xl">`;
+            
+            if (gameState.activeEvent) {
+                html += `
+                <div class="bg-slate-700/50 rounded-xl p-4 border border-slate-600 animate-in slide-in-from-left-4 fade-in">
+                    <div class="flex items-center gap-2 text-yellow-400 font-bold mb-2">
+                        <i data-lucide="alert-triangle" class="w-4 h-4"></i> Active Event
+                    </div>
+                    <h3 class="font-bold text-white mb-1">${gameState.activeEvent.title}</h3>
+                    <p class="text-sm text-slate-300">${gameState.activeEvent.description}</p>
+                </div>`;
+            }
+
+            html += `
+            <div>
+                <h2 class="text-sm font-bold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2">
+                    <i data-lucide="plus" class="w-4 h-4"></i> Build Infrastructure
+                </h2>
+                <div class="grid grid-cols-2 gap-3">
+            `;
+            
+            Object.entries(ROUTE_CONFIGS).forEach(([key, config]) => {
+                const isSelected = placement.type === key;
+                const isDisabled = placement.active && !isSelected;
+                html += `
+                <button
+                    onclick="placement={active:true, type:'${key}', stops:[]}; render();"
+                    ${isDisabled ? 'disabled' : ''}
+                    class="p-3 rounded-xl border flex flex-col items-center justify-center gap-2 transition-all duration-300
+                        ${isSelected ? 'bg-blue-600 border-blue-400 shadow-[0_0_15px_rgba(59,130,246,0.5)] scale-105' : 'bg-slate-700 border-slate-600 hover:border-slate-400 hover:bg-slate-600'}
+                        ${isDisabled ? 'opacity-50 cursor-not-allowed' : ''}
+                    "
+                >
+                    <i data-lucide="${getRouteIconName(key)}" style="width: 28px; height: 28px; color: ${ROUTE_COLORS[key]}"></i>
+                    <div class="text-center">
+                        <span class="block text-sm font-bold capitalize">${config.name}</span>
+                        <span class="block text-xs text-slate-400">$${config.costPerKm}/km</span>
+                    </div>
+                </button>`;
+            });
+            html += `</div></div>`;
+
+            if (placement.active) {
+                let currentDistance = 0;
+                for(let i=0; i<placement.stops.length-1; i++) {
+                    const c1 = gameState.grid.find(c => c.id === placement.stops[i]);
+                    const c2 = gameState.grid.find(c => c.id === placement.stops[i+1]);
+                    currentDistance += calculateDistance(c1, c2);
+                }
+                const currentCost = currentDistance * ROUTE_CONFIGS[placement.type].costPerKm;
+                const isOverBudget = currentCost > gameState.budget;
+
+                html += `
+                <div class="bg-blue-900/40 rounded-xl p-4 border border-blue-500/50 mt-auto animate-in slide-in-from-bottom-4">
+                    <h3 class="font-bold text-blue-300 mb-2 flex items-center gap-2">
+                        <i data-lucide="map" class="w-4 h-4"></i> Placement Mode
+                    </h3>
+                    <p class="text-sm text-blue-100 mb-4">Select cells on the map to create stops for your new ${ROUTE_CONFIGS[placement.type].name}.</p>
+                    
+                    <div class="flex flex-col gap-2 mb-4">
+                        <div class="flex items-center justify-between">
+                            <span class="text-sm bg-blue-950/50 px-3 py-1 rounded-full border border-blue-800">Stops: ${placement.stops.length}</span>
+                            <span class="text-sm text-blue-200">Dist: ${currentDistance}km</span>
+                        </div>
+                        ${currentDistance > 0 ? `
+                        <div class="flex items-center justify-between bg-slate-800/50 p-2 rounded border border-slate-700">
+                            <span class="text-sm text-slate-300">Est. Cost:</span>
+                            <span class="text-sm font-bold ${isOverBudget ? 'text-red-400' : 'text-green-400'}">
+                                $${currentCost.toLocaleString()}
+                            </span>
+                        </div>
+                        ` : ''}
+                    </div>
+                    <div class="flex gap-2">
+                        <button onclick="confirmRoute()" ${(placement.stops.length < 2 || isOverBudget) ? 'disabled' : ''} class="flex-1 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 text-white py-2 rounded font-medium transition-colors shadow-lg">Confirm</button>
+                        <button onclick="placement={active:false, type:null, stops:[]}; render();" class="flex-1 bg-slate-700 hover:bg-slate-600 text-white py-2 rounded font-medium transition-colors">Cancel</button>
+                    </div>
+                </div>`;
+            }
+
+            html += `
+            <div class="mt-auto pt-4 border-t border-slate-700">
+                <h2 class="text-sm font-bold text-slate-400 uppercase tracking-wider mb-3">Active Routes</h2>
+                <div class="space-y-2 max-h-48 overflow-y-auto pr-2">
+            `;
+            if (gameState.routes.length === 0) {
+                html += `<p class="text-sm text-slate-500 italic bg-slate-800/50 p-3 rounded text-center border border-slate-700 border-dashed">No routes built yet.</p>`;
+            } else {
+                gameState.routes.forEach(r => {
+                    const isSelected = selectedRouteId === r.id;
+                    html += `
+                    <div onclick="selectedRouteId = selectedRouteId === '${r.id}' ? null : '${r.id}'; render();"
+                        class="flex flex-col gap-2 p-2.5 rounded-lg border transition-colors cursor-pointer ${isSelected ? 'bg-slate-700 border-blue-400 shadow-[0_0_10px_rgba(59,130,246,0.3)]' : 'bg-slate-700/50 border-slate-600/50 hover:bg-slate-700'}"
+                    >
+                        <div class="flex items-center gap-3">
+                            <i data-lucide="${getRouteIconName(r.type)}" style="width: 20px; height: 20px; color: ${r.color}"></i>
+                            <span class="text-sm font-medium capitalize text-slate-200">${r.type} Line</span>
+                            <span class="text-xs text-slate-400 ml-auto bg-slate-800 px-2 py-0.5 rounded-full">${r.stops.length} stops</span>
+                        </div>
+                        ${isSelected ? `
+                        <button onclick="deleteRoute(event)" class="w-full mt-1 bg-red-600/80 hover:bg-red-500 text-white text-xs py-1.5 rounded flex items-center justify-center gap-1 transition-colors">
+                            <i data-lucide="x" class="w-3.5 h-3.5"></i> Delete Route ($0)
+                        </button>
+                        ` : ''}
+                    </div>`;
+                });
+            }
+            html += `</div></div></aside>`;
+
+            // Map Area
+            html += `
+            <div class="flex-1 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-slate-800 via-slate-900 to-slate-950 p-8 overflow-auto flex items-center justify-center relative">
+                <div class="relative shadow-2xl rounded-lg p-2 bg-slate-800/50 border border-slate-700/50 backdrop-blur-sm" style="width: 640px; height: 640px;">
+                    
+                    <!-- Grid Layout -->
+                    <div class="absolute inset-2 grid gap-1.5" style="grid-template-columns: repeat(${gameState.gridWidth}, 1fr); grid-template-rows: repeat(${gameState.gridHeight}, 1fr)">
+            `;
+            
+            gameState.grid.forEach(cell => {
+                const isValidTarget = !placement.active || placement.type !== 'ferry' || cell.type === 'water';
+                const isPlaced = placement.stops.includes(cell.id);
+                
+                let cls = "relative rounded-md transition-all duration-300 overflow-hidden border-2 flex items-center justify-center ";
+                if(placement.active && isValidTarget) cls += "hover:scale-95 hover:z-10 shadow-[0_0_15px_rgba(255,255,255,0.2)] cursor-pointer ";
+                else cls += "cursor-pointer ";
+                if(placement.active && !isValidTarget) cls += "opacity-40 cursor-not-allowed ";
+                if(isPlaced) cls += "border-white scale-90 z-20 shadow-[0_0_20px_rgba(255,255,255,0.4)] ";
+                else cls += "border-slate-800/30 ";
+
+                html += `
+                <div onclick="${isValidTarget ? `toggleStop('${cell.id}')` : ''}" class="${cls}" style="background-color: ${CELL_COLORS[cell.type]}">
+                    <div class="absolute inset-0 opacity-10 bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0IiBoZWlnaHQ9IjQiPgo8cmVjdCB3aWR0aD0iNCIgaGVpZ2h0PSI0IiBmaWxsPSIjZmZmIiBmaWxsLW9wYWNpdHk9IjAuMSIvPgo8L3N2Zz4=')]"></div>
+                    ${getCellIconHTML(cell.type)}
+                    ${cell.hasStation ? `
+                    <div class="absolute inset-0 flex items-center justify-center">
+                        <div class="w-5 h-5 bg-white/90 rounded-sm shadow-lg border-2 border-slate-900 flex items-center justify-center rotate-45 transform animate-in zoom-in duration-300">
+                            <div class="w-2 h-2 bg-slate-900 rounded-full"></div>
+                        </div>
+                    </div>
+                    ` : ''}
+                    <div class="absolute inset-0 opacity-0 hover:opacity-100 bg-slate-900/80 backdrop-blur-sm flex flex-col items-center justify-center text-[11px] text-white font-bold transition-all duration-200">
+                        <span class="capitalize text-blue-300">${cell.type}</span>
+                        <span class="flex items-center gap-1 mt-1"><i data-lucide="users" class="w-2.5 h-2.5"></i> ${cell.population}</span>
+                    </div>
+                </div>
+                `;
+            });
+
+            html += `</div>`;
+
+            // SVG Paths Layer
+            const SVG_VIEWBOX_SIZE = 1000;
+            const cellW = SVG_VIEWBOX_SIZE / gameState.gridWidth;
+            const cellH = SVG_VIEWBOX_SIZE / gameState.gridHeight;
+
+            html += `
+            <svg class="absolute inset-2 pointer-events-none drop-shadow-xl z-30" viewBox="0 0 ${SVG_VIEWBOX_SIZE} ${SVG_VIEWBOX_SIZE}" preserveAspectRatio="none" style="width: calc(100% - 16px); height: calc(100% - 16px); overflow: visible;">
+            `;
+
+            gameState.routes.forEach(route => {
+                const isSelected = selectedRouteId === route.id;
+                const isFaded = selectedRouteId && !isSelected;
+
+                const pathData = route.stops.map((stopId, index) => {
+                    const cell = gameState.grid.find(c => c.id === stopId);
+                    const cx = (cell.x * cellW) + (cellW / 2);
+                    const cy = (cell.y * cellH) + (cellH / 2);
+                    return `${index === 0 ? 'M' : 'L'} ${cx} ${cy}`;
+                }).join(' ');
+
+                html += `
+                <g class="transition-opacity duration-300 ${isFaded ? 'opacity-20' : 'opacity-100'}">
+                    <path d="${pathData}" fill="none" stroke="${route.color}" stroke-width="${isSelected ? 20 : 14}" stroke-linecap="round" stroke-linejoin="round" class="blur-[4px] transition-all duration-300 ${isSelected ? 'opacity-60' : 'opacity-30'}" />
+                    <path id="route-${route.id}" d="${pathData}" fill="none" stroke="${route.color}" stroke-width="${isSelected ? 10 : 8}" stroke-linecap="round" stroke-linejoin="round" class="opacity-90 transition-all duration-300" />
+                    
+                    ${route.stops.length > 1 ? `
+                    <g class="drop-shadow-lg">
+                        <animateMotion dur="${route.stops.length * 1.5}s" repeatCount="indefinite">
+                            <mpath href="#route-${route.id}" />
+                        </animateMotion>
+                        <foreignObject x="-14" y="-14" width="28" height="28">
+                            <div xmlns="http://www.w3.org/1999/xhtml" class="w-full h-full bg-slate-800 rounded-full flex items-center justify-center border-2 shadow-lg" style="border-color: ${route.color}">
+                                <i data-lucide="${getRouteIconName(route.type)}" style="width: 14px; height: 14px; color: ${route.color}"></i>
+                            </div>
+                        </foreignObject>
+                    </g>
+                    ` : ''}
+                </g>`;
+            });
+
+            if (placement.active && placement.stops.length > 0) {
+                const dashPath = placement.stops.map((stopId, index) => {
+                    const cell = gameState.grid.find(c => c.id === stopId);
+                    const cx = (cell.x * cellW) + (cellW / 2);
+                    const cy = (cell.y * cellH) + (cellH / 2);
+                    return `${index === 0 ? 'M' : 'L'} ${cx} ${cy}`;
+                }).join(' ');
+                
+                html += `
+                <path d="${dashPath}" fill="none" stroke="#ffffff" stroke-width="6" stroke-dasharray="12 12" stroke-linecap="round" stroke-linejoin="round" class="animate-[dash_1s_linear_infinite] drop-shadow-[0_0_5px_rgba(255,255,255,0.8)]" />
+                `;
+            }
+
+            html += `</svg></div></div></main>`;
+
+            return html;
+        };
+
+        const render = () => {
+            const app = document.getElementById('app');
+            
+            // Save scroll position for sidebar
+            const sidebar = document.getElementById('sidebar-scroll');
+            if(sidebar) sidebarScroll = sidebar.scrollTop;
+
+            if (!gameState) {
+                app.innerHTML = getStartScreenHTML();
+            } else if (gameState.gameOver) {
+                app.innerHTML = getGameOverScreenHTML();
+            } else {
+                app.innerHTML = getGameScreenHTML();
+            }
+
+            // Init lucide icons
+            lucide.createIcons();
+
+            // Restore scroll position
+            const newSidebar = document.getElementById('sidebar-scroll');
+            if(newSidebar) newSidebar.scrollTop = sidebarScroll;
+        };
+
+        // Initialize application
+        render();
+
+    </script>
+</body>
+</html>
