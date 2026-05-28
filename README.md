@@ -1,4 +1,4 @@
-Urban Transit Sim 🚇🌿
+Urban Transit Sim 🚇
 
 A lightweight, turn-based public transportation simulator built entirely with vanilla HTML, JavaScript, and Tailwind CSS. Step into the role of Transit Director and build a sustainable transit network for your city.
 
